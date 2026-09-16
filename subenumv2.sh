@@ -8,26 +8,36 @@
 # Repository
 # https://github.com/SleepTheGod/Subenum
 #
-# Usage
-#   ./subenum.sh [options] domain [domain ...]
+# Supports
+#   Passive subdomain enumeration with ProjectDiscovery Subfinder
+#   Multiple targets
+#   Target files
+#   Target normalization
+#   Domain boundary validation
+#   A and AAAA DNS resolution
+#   Subdomain to IP correlation
+#   Resolved and unresolved host tracking
+#   Combined results
+#   Raw Subfinder output preservation
+#   Automatic Subfinder discovery
+#   Optional Subfinder installation
+#   Quiet mode
+#   Short and long command line options
 #
 # Examples
 #   ./subenum.sh doxbin.com
 #   ./subenum.sh -r doxbin.com
+#   ./subenum.sh example.com example.org
+#   ./subenum.sh -f targets.txt
 #   ./subenum.sh -f targets.txt -r
-#   ./subenum.sh -o /opt/recon doxbin.com
+#   ./subenum.sh -f targets.txt -r -o /opt/recon
+#   ./subenum.sh -i doxbin.com
 #
-# Requirements
-#   Bash
-#   Subfinder
-#   dig
-#   awk
-#   sed
-#   grep
-#   sort
-#   tr
-#   mkdir
-#   tee
+# No port scanning
+# No exploitation
+# No brute forcing
+# No credential attacks
+# No service interaction
 #
 
 set -Eeuo pipefail
@@ -45,9 +55,11 @@ INSTALL_MISSING=0
 
 declare -a TARGETS=()
 
-# ------------------------------------------------------------
-# Colors
-# ------------------------------------------------------------
+TMP_DIR=""
+
+# ============================================================
+# Terminal colors
+# ============================================================
 
 if [[ -t 1 ]]; then
     BOLD=$'\033[1m'
@@ -67,11 +79,9 @@ else
     RESET=""
 fi
 
-# ------------------------------------------------------------
+# ============================================================
 # Cleanup
-# ------------------------------------------------------------
-
-TMP_DIR=""
+# ============================================================
 
 cleanup() {
     if [[ -n "${TMP_DIR:-}" && -d "$TMP_DIR" ]]; then
@@ -86,9 +96,9 @@ trap '
     exit 130
 ' INT TERM
 
-# ------------------------------------------------------------
+# ============================================================
 # Logging
-# ------------------------------------------------------------
+# ============================================================
 
 log() {
     (( QUIET )) && return 0
@@ -109,9 +119,9 @@ die() {
     exit 1
 }
 
-# ------------------------------------------------------------
+# ============================================================
 # Help
-# ------------------------------------------------------------
+# ============================================================
 
 show_help() {
     cat <<EOF
@@ -130,14 +140,27 @@ ${BOLD}Usage${RESET}
 ${BOLD}Options${RESET}
 
   -f FILE       Read targets from a file
+  --file=FILE   Read targets from a file
+
   -o DIR        Set the output directory
-  -r            Resolve discovered subdomains to IP addresses
-  -i            Install Subfinder automatically if missing
+  --output=DIR  Set the output directory
+
+  -r            Resolve discovered hosts with DNS
+  --resolve     Resolve discovered hosts with DNS
+
+  -i            Install Subfinder if missing
+  --install     Install Subfinder if missing
+
   -q            Quiet mode
+  --quiet       Quiet mode
+
   -h            Show this help
   --help        Show this help
+
   -v            Show version
   --version     Show version
+
+  --            End option processing
 
 ${BOLD}Examples${RESET}
 
@@ -153,26 +176,14 @@ ${BOLD}Examples${RESET}
 
   $0 -o /opt/recon example.com
 
+  $0 -f targets.txt -r -o /opt/recon
+
   $0 -i example.com
 
-${BOLD}Output${RESET}
+${BOLD}DNS Correlation${RESET}
 
-  subenum-results/
-  └── example.com/
-      ├── raw/
-      │   └── subfinder.raw.txt
-      ├── hosts/
-      │   └── subdomains.txt
-      ├── dns/
-      │   ├── subdomains-ip.txt
-      │   ├── resolved-hosts.txt
-      │   └── unresolved-hosts.txt
-      └── summary.txt
-
-${BOLD}IP Mapping${RESET}
-
-  When -r is enabled, every discovered hostname is resolved
-  individually and the resulting addresses are correlated.
+  When -r is enabled, discovered hostnames are resolved
+  individually for A and AAAA records.
 
   Example
 
@@ -180,11 +191,35 @@ ${BOLD}IP Mapping${RESET}
     mail.example.com      192.0.2.20
     www.example.com       192.0.2.30
 
+${BOLD}Output${RESET}
+
+  DIR/
+    all-subdomains.txt
+    all-subdomains-ip.txt
+    summary.txt
+
+    DOMAIN/
+      raw/
+        subfinder.raw.txt
+
+      hosts/
+        subdomains.txt
+
+      dns/
+        subdomains-ip.txt
+        resolved-hosts.txt
+        unresolved-hosts.txt
+
 ${BOLD}Requirements${RESET}
 
   Bash
   ProjectDiscovery Subfinder
+
+  DNS resolution additionally requires
+
   dig
+  cut
+  comm
 
 ${BOLD}Repository${RESET}
 
@@ -192,8 +227,8 @@ ${BOLD}Repository${RESET}
 
 ${BOLD}Authorization${RESET}
 
-  Use this tool only against domains you own or are authorized
-  to assess.
+  Use this tool only against domains you own or are
+  explicitly authorized to assess.
 
 EOF
 }
@@ -203,21 +238,20 @@ show_version() {
     printf "Made By %s\n" "$AUTHOR"
 }
 
-# ------------------------------------------------------------
+# ============================================================
 # Dependency checking
-# ------------------------------------------------------------
+# ============================================================
 
 need_command() {
     local command_name="$1"
 
-    if ! command -v "$command_name" >/dev/null 2>&1; then
+    command -v "$command_name" >/dev/null 2>&1 ||
         die "Required command not found $command_name"
-    fi
 }
 
-# ------------------------------------------------------------
+# ============================================================
 # Domain normalization
-# ------------------------------------------------------------
+# ============================================================
 
 normalize_domain() {
     local value="$1"
@@ -240,29 +274,30 @@ normalize_domain() {
         tr '[:upper:]' '[:lower:]'
 }
 
-# ------------------------------------------------------------
+# ============================================================
 # Domain validation
-# ------------------------------------------------------------
+# ============================================================
 
 valid_domain() {
     local domain="$1"
 
     [[ -n "$domain" ]] || return 1
+
     [[ ${#domain} -le 253 ]] || return 1
+
     [[ "$domain" == *.* ]] || return 1
 
-    [[ "$domain" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] ||
-        return 1
+    [[ "$domain" != *..* ]] || return 1
 
-    [[ "$domain" != *..* ]] ||
+    [[ "$domain" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] ||
         return 1
 
     return 0
 }
 
-# ------------------------------------------------------------
-# Load targets
-# ------------------------------------------------------------
+# ============================================================
+# Load and normalize targets
+# ============================================================
 
 load_targets() {
     local line
@@ -273,6 +308,9 @@ load_targets() {
 
         [[ -f "$TARGET_FILE" ]] ||
             die "Target file not found $TARGET_FILE"
+
+        [[ -r "$TARGET_FILE" ]] ||
+            die "Target file is not readable $TARGET_FILE"
 
         while IFS= read -r line || [[ -n "$line" ]]; do
 
@@ -310,11 +348,14 @@ load_targets() {
         printf '%s\n' "${TARGETS[@]}" |
             sort -fu
     )
+
+    [[ ${#TARGETS[@]} -gt 0 ]] ||
+        die "No valid targets remain after normalization"
 }
 
-# ------------------------------------------------------------
+# ============================================================
 # Locate Subfinder
-# ------------------------------------------------------------
+# ============================================================
 
 find_subfinder() {
     local candidate
@@ -355,30 +396,43 @@ find_subfinder() {
     return 1
 }
 
-# ------------------------------------------------------------
-# Optional Subfinder installation
-# ------------------------------------------------------------
+# ============================================================
+# Install Subfinder
+# ============================================================
 
 install_subfinder() {
     local go_cmd=""
     local go_path=""
 
     if command -v go >/dev/null 2>&1; then
+
         go_cmd="$(command -v go)"
+
     elif [[ -x "/usr/local/go/bin/go" ]]; then
+
         go_cmd="/usr/local/go/bin/go"
+
         export PATH="/usr/local/go/bin:$PATH"
+
     else
+
         die "Go is required to automatically install Subfinder"
     fi
 
     log "Using Go $go_cmd"
     log "Installing Subfinder"
 
-    "$go_cmd" install \
+    if ! "$go_cmd" install \
         github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+    then
+        die "Subfinder installation failed"
+    fi
 
-    go_path="$("$go_cmd" env GOPATH)"
+    go_path="$("$go_cmd" env GOPATH 2>/dev/null)" ||
+        die "Unable to determine Go GOPATH"
+
+    [[ -n "$go_path" ]] ||
+        die "Go GOPATH is empty"
 
     export PATH="$go_path/bin:$PATH"
 
@@ -420,9 +474,34 @@ EOF
     exit 1
 }
 
-# ------------------------------------------------------------
-# Create target directories
-# ------------------------------------------------------------
+# ============================================================
+# Validate Subfinder
+# ============================================================
+
+validate_subfinder() {
+    local binary="$1"
+
+    [[ -x "$binary" ]] ||
+        die "Subfinder executable is not usable $binary"
+
+    "$binary" -version >/dev/null 2>&1 ||
+        die "Subfinder executable is not working $binary"
+}
+
+# ============================================================
+# Prepare output
+# ============================================================
+
+prepare_output() {
+    mkdir -p "$OUT" ||
+        die "Unable to create output directory $OUT"
+
+    [[ -d "$OUT" ]] ||
+        die "Output path is not a directory $OUT"
+
+    [[ -w "$OUT" ]] ||
+        die "Output directory is not writable $OUT"
+}
 
 prepare_target() {
     local domain="$1"
@@ -434,108 +513,9 @@ prepare_target() {
         "$target_dir/dns"
 }
 
-# ------------------------------------------------------------
-# Enumerate target
-# ------------------------------------------------------------
-
-enumerate_target() {
-    local domain="$1"
-    local target_dir="$OUT/$domain"
-
-    local raw_file="$target_dir/raw/subfinder.raw.txt"
-    local host_file="$target_dir/hosts/subdomains.txt"
-    local dns_file="$target_dir/dns/subdomains-ip.txt"
-    local resolved_file="$target_dir/dns/resolved-hosts.txt"
-    local unresolved_file="$target_dir/dns/unresolved-hosts.txt"
-
-    prepare_target "$domain"
-
-    : > "$raw_file"
-    : > "$host_file"
-
-    log "Enumerating $domain"
-
-    if ! "$SUBFINDER_BIN" \
-        -d "$domain" \
-        -all \
-        -recursive \
-        -silent \
-        -o "$raw_file"
-    then
-
-        warn "Subfinder failed for $domain"
-        return 1
-    fi
-
-    if [[ ! -s "$raw_file" ]]; then
-        warn "No subdomains returned for $domain"
-        return 0
-    fi
-
-    # --------------------------------------------------------
-    # Strict hostname filtering
-    # --------------------------------------------------------
-
-    awk -v domain="$domain" '
-        BEGIN {
-            IGNORECASE = 1
-            suffix = "." domain
-        }
-
-        {
-            gsub(/\r/, "")
-            gsub(/^[[:space:]]+|[[:space:]]+$/, "")
-
-            host = tolower($0)
-
-            if (host == domain) {
-                print host
-                next
-            }
-
-            if (
-                length(host) > length(suffix) &&
-                substr(
-                    host,
-                    length(host) - length(suffix) + 1
-                ) == suffix
-            ) {
-                print host
-            }
-        }
-    ' "$raw_file" |
-        sed 's/\.$//' |
-        sort -fu > "$host_file"
-
-    local count
-    count="$(wc -l < "$host_file")"
-
-    log "$domain discovered $count hosts"
-
-    # --------------------------------------------------------
-    # DNS
-    # --------------------------------------------------------
-
-    if (( RESOLVE )); then
-
-        resolve_hosts \
-            "$host_file" \
-            "$dns_file"
-
-        build_dns_host_lists \
-            "$host_file" \
-            "$dns_file" \
-            "$resolved_file" \
-            "$unresolved_file"
-
-    fi
-
-    return 0
-}
-
-# ------------------------------------------------------------
+# ============================================================
 # Resolve hosts
-# ------------------------------------------------------------
+# ============================================================
 
 resolve_hosts() {
     local hosts="$1"
@@ -592,9 +572,9 @@ resolve_hosts() {
     sort -u "$output" -o "$output"
 }
 
-# ------------------------------------------------------------
+# ============================================================
 # Build resolved and unresolved host lists
-# ------------------------------------------------------------
+# ============================================================
 
 build_dns_host_lists() {
     local hosts="$1"
@@ -618,24 +598,146 @@ build_dns_host_lists() {
         > "$unresolved"
 }
 
-# ------------------------------------------------------------
-# Display correlated hostname and IP
-# ------------------------------------------------------------
+# ============================================================
+# Enumerate one target
+# ============================================================
+
+enumerate_target() {
+    local domain="$1"
+
+    local target_dir="$OUT/$domain"
+
+    local raw_file="$target_dir/raw/subfinder.raw.txt"
+    local host_file="$target_dir/hosts/subdomains.txt"
+
+    local dns_file="$target_dir/dns/subdomains-ip.txt"
+    local resolved_file="$target_dir/dns/resolved-hosts.txt"
+    local unresolved_file="$target_dir/dns/unresolved-hosts.txt"
+
+    prepare_target "$domain"
+
+    : > "$raw_file"
+    : > "$host_file"
+
+    log "Enumerating $domain"
+
+    if ! "$SUBFINDER_BIN" \
+        -d "$domain" \
+        -all \
+        -recursive \
+        -silent \
+        -o "$raw_file"
+    then
+
+        warn "Subfinder failed for $domain"
+
+        return 1
+    fi
+
+    if [[ ! -s "$raw_file" ]]; then
+
+        warn "No subdomains returned for $domain"
+
+        if (( RESOLVE )); then
+            : > "$dns_file"
+            : > "$resolved_file"
+            : > "$unresolved_file"
+        fi
+
+        return 0
+    fi
+
+    # --------------------------------------------------------
+    # Strict hostname filtering
+    # --------------------------------------------------------
+
+    awk -v domain="$domain" '
+        BEGIN {
+            IGNORECASE = 1
+            suffix = "." domain
+        }
+
+        {
+            gsub(/\r/, "")
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+
+            host = tolower($0)
+
+            if (host == domain) {
+                print host
+                next
+            }
+
+            if (
+                length(host) > length(suffix) &&
+                substr(
+                    host,
+                    length(host) - length(suffix) + 1
+                ) == suffix
+            ) {
+                print host
+            }
+        }
+    ' "$raw_file" |
+        sed 's/\.$//' |
+        sort -fu > "$host_file"
+
+    local count
+
+    count="$(wc -l < "$host_file")"
+
+    log "$domain discovered $count hosts"
+
+    # --------------------------------------------------------
+    # Optional DNS
+    # --------------------------------------------------------
+
+    if (( RESOLVE )); then
+
+        resolve_hosts \
+            "$host_file" \
+            "$dns_file"
+
+        build_dns_host_lists \
+            "$host_file" \
+            "$dns_file" \
+            "$resolved_file" \
+            "$unresolved_file"
+
+        log "$domain DNS records $(wc -l < "$dns_file")"
+        log "$domain resolved hosts $(wc -l < "$resolved_file")"
+        log "$domain unresolved hosts $(wc -l < "$unresolved_file")"
+
+    fi
+
+    return 0
+}
+
+# ============================================================
+# Display hostname to IP mapping
+# ============================================================
 
 display_results() {
     local dns="$1"
     local hosts="$2"
 
     echo
+
     printf '%s\n' \
-        "${BOLD}======================================================================${RESET}"
+        "${BOLD}${CYAN}======================================================================${RESET}"
+
     printf '%s\n' \
         "${BOLD}                       SUBDOMAIN / IP${RESET}"
+
     printf '%s\n' \
-        "${BOLD}======================================================================${RESET}"
+        "${BOLD}${CYAN}======================================================================${RESET}"
+
     echo
 
-    printf '%-70s %s\n' "SUBDOMAIN" "IP"
+    printf '%-70s %s\n' \
+        "SUBDOMAIN" \
+        "IP"
+
     printf '%-70s %s\n' \
         "----------------------------------------------------------------------" \
         "----------------"
@@ -663,15 +765,18 @@ display_results() {
     done < <(
         comm -23 \
             <(sort -fu "$hosts") \
-            <(cut -f1 "$dns" 2>/dev/null | sort -fu)
+            <(
+                cut -f1 "$dns" 2>/dev/null |
+                    sort -fu
+            )
     )
 
     echo
 }
 
-# ------------------------------------------------------------
+# ============================================================
 # Build combined results
-# ------------------------------------------------------------
+# ============================================================
 
 build_combined_results() {
     local combined_hosts="$OUT/all-subdomains.txt"
@@ -689,11 +794,13 @@ build_combined_results() {
         hosts="$OUT/$target/hosts/subdomains.txt"
         dns="$OUT/$target/dns/subdomains-ip.txt"
 
-        [[ -f "$hosts" ]] &&
+        if [[ -f "$hosts" ]]; then
             cat "$hosts" >> "$combined_hosts"
+        fi
 
-        [[ -f "$dns" ]] &&
+        if [[ -f "$dns" ]]; then
             cat "$dns" >> "$combined_ips"
+        fi
 
     done
 
@@ -706,9 +813,9 @@ build_combined_results() {
         -o "$combined_ips"
 }
 
-# ------------------------------------------------------------
+# ============================================================
 # Build summary
-# ------------------------------------------------------------
+# ============================================================
 
 build_summary() {
     local summary="$OUT/summary.txt"
@@ -717,20 +824,33 @@ build_summary() {
         echo "SUBENUM REPORT"
         echo "=============="
         echo
+
         echo "Program"
         echo "$PROGRAM"
         echo
+
         echo "Version"
         echo "$VERSION"
         echo
+
         echo "Made By"
         echo "$AUTHOR"
         echo
+
         echo "Generated UTC"
         date -u '+%Y-%m-%d %H:%M:%S'
         echo
+
         echo "Targets"
         echo "${#TARGETS[@]}"
+        echo
+
+        echo "DNS Resolution"
+        if (( RESOLVE )); then
+            echo "Enabled"
+        else
+            echo "Disabled"
+        fi
         echo
 
         local target
@@ -750,6 +870,7 @@ build_summary() {
             echo "$target"
 
             echo "Subdomains"
+
             if [[ -f "$hosts" ]]; then
                 wc -l < "$hosts"
             else
@@ -759,6 +880,7 @@ build_summary() {
             if (( RESOLVE )); then
 
                 echo "Resolved hosts"
+
                 if [[ -f "$resolved" ]]; then
                     wc -l < "$resolved"
                 else
@@ -766,6 +888,7 @@ build_summary() {
                 fi
 
                 echo "Unresolved hosts"
+
                 if [[ -f "$unresolved" ]]; then
                     wc -l < "$unresolved"
                 else
@@ -773,6 +896,7 @@ build_summary() {
                 fi
 
                 echo "DNS records"
+
                 if [[ -f "$dns" ]]; then
                     wc -l < "$dns"
                 else
@@ -786,6 +910,7 @@ build_summary() {
         done
 
         echo "Combined subdomains"
+
         if [[ -f "$OUT/all-subdomains.txt" ]]; then
             wc -l < "$OUT/all-subdomains.txt"
         else
@@ -796,6 +921,7 @@ build_summary() {
 
             echo
             echo "Combined DNS mappings"
+
             if [[ -f "$OUT/all-subdomains-ip.txt" ]]; then
                 wc -l < "$OUT/all-subdomains-ip.txt"
             else
@@ -804,17 +930,25 @@ build_summary() {
 
         fi
 
+        echo
+        echo "Output Directory"
+        echo "$OUT"
+
     } > "$summary"
 }
 
-# ------------------------------------------------------------
+# ============================================================
 # Main
-# ------------------------------------------------------------
+# ============================================================
 
 main() {
 
     local positional=()
     local arg
+
+    # --------------------------------------------------------
+    # Command line parser
+    # --------------------------------------------------------
 
     while [[ $# -gt 0 ]]; do
 
@@ -835,11 +969,16 @@ main() {
                     die "-f requires a file"
 
                 TARGET_FILE="$2"
+
                 shift 2
                 ;;
 
             --file=*)
                 TARGET_FILE="${1#*=}"
+
+                [[ -n "$TARGET_FILE" ]] ||
+                    die "--file requires a file"
+
                 shift
                 ;;
 
@@ -848,11 +987,16 @@ main() {
                     die "-o requires a directory"
 
                 OUT="$2"
+
                 shift 2
                 ;;
 
             --output=*)
                 OUT="${1#*=}"
+
+                [[ -n "$OUT" ]] ||
+                    die "--output requires a directory"
+
                 shift
                 ;;
 
@@ -896,7 +1040,7 @@ main() {
     done
 
     # --------------------------------------------------------
-    # Dependencies
+    # Required dependencies
     # --------------------------------------------------------
 
     need_command awk
@@ -906,11 +1050,16 @@ main() {
     need_command tr
     need_command mkdir
     need_command tee
+    need_command mktemp
+    need_command date
+    need_command wc
 
     if (( RESOLVE )); then
+
         need_command dig
         need_command cut
         need_command comm
+
     fi
 
     # --------------------------------------------------------
@@ -923,11 +1072,7 @@ main() {
     # Output
     # --------------------------------------------------------
 
-    mkdir -p "$OUT" ||
-        die "Unable to create output directory $OUT"
-
-    [[ -w "$OUT" ]] ||
-        die "Output directory is not writable $OUT"
+    prepare_output
 
     TMP_DIR="$(mktemp -d)"
 
@@ -937,8 +1082,7 @@ main() {
 
     SUBFINDER_BIN="$(setup_subfinder)"
 
-    [[ -x "$SUBFINDER_BIN" ]] ||
-        die "Subfinder executable is not usable $SUBFINDER_BIN"
+    validate_subfinder "$SUBFINDER_BIN"
 
     # --------------------------------------------------------
     # Banner
@@ -947,6 +1091,7 @@ main() {
     if (( ! QUIET )); then
 
         echo
+
         printf '%s\n' \
             "${BOLD}${CYAN}======================================================================${RESET}"
 
@@ -963,12 +1108,33 @@ main() {
             "${BOLD}${CYAN}======================================================================${RESET}"
 
         echo
-        printf '%s %s\n' "Version" "$VERSION"
-        printf '%s %s\n' "Subfinder" "$SUBFINDER_BIN"
-        printf '%s %s\n' "Targets" "${#TARGETS[@]}"
-        printf '%s %s\n' "Output" "$OUT"
-        printf '%s %s\n' "DNS Resolution" \
-            "$([[ $RESOLVE -eq 1 ]] && echo enabled || echo disabled)"
+
+        printf '%-20s %s\n' \
+            "Version" \
+            "$VERSION"
+
+        printf '%-20s %s\n' \
+            "Subfinder" \
+            "$SUBFINDER_BIN"
+
+        printf '%-20s %s\n' \
+            "Targets" \
+            "${#TARGETS[@]}"
+
+        printf '%-20s %s\n' \
+            "Output" \
+            "$OUT"
+
+        if (( RESOLVE )); then
+            printf '%-20s %s\n' \
+                "DNS Resolution" \
+                "enabled"
+        else
+            printf '%-20s %s\n' \
+                "DNS Resolution" \
+                "disabled"
+        fi
+
         echo
 
     fi
@@ -993,13 +1159,18 @@ main() {
     # --------------------------------------------------------
 
     build_combined_results
+
+    # --------------------------------------------------------
+    # Summary
+    # --------------------------------------------------------
+
     build_summary
 
     # --------------------------------------------------------
-    # Display results
+    # Display correlated results
     # --------------------------------------------------------
 
-    if (( RESOLVE )); then
+    if (( RESOLVE && ! QUIET )); then
 
         for target in "${TARGETS[@]}"; do
 
@@ -1009,6 +1180,7 @@ main() {
             if [[ -f "$target_hosts" ]]; then
 
                 echo
+
                 printf '%s\n' \
                     "${BOLD}${CYAN}Target $target${RESET}"
 
@@ -1026,64 +1198,77 @@ main() {
     # Final report
     # --------------------------------------------------------
 
-    echo
-    printf '%s\n' \
-        "${BOLD}${GREEN}======================================================================${RESET}"
+    if (( ! QUIET )); then
 
-    printf '%s\n' \
-        "${BOLD}                         ENUMERATION COMPLETE${RESET}"
+        echo
 
-    printf '%s\n' \
-        "${BOLD}${GREEN}======================================================================${RESET}"
+        printf '%s\n' \
+            "${BOLD}${GREEN}======================================================================${RESET}"
 
-    echo
+        printf '%s\n' \
+            "${BOLD}                         ENUMERATION COMPLETE${RESET}"
 
-    printf '%-25s %s\n' \
-        "Targets" \
-        "${#TARGETS[@]}"
+        printf '%s\n' \
+            "${BOLD}${GREEN}======================================================================${RESET}"
 
-    printf '%-25s %s\n' \
-        "Unique subdomains" \
-        "$(wc -l < "$OUT/all-subdomains.txt")"
-
-    if (( RESOLVE )); then
+        echo
 
         printf '%-25s %s\n' \
-            "DNS mappings" \
-            "$(wc -l < "$OUT/all-subdomains-ip.txt")"
+            "Targets" \
+            "${#TARGETS[@]}"
+
+        printf '%-25s %s\n' \
+            "Unique subdomains" \
+            "$(wc -l < "$OUT/all-subdomains.txt")"
+
+        if (( RESOLVE )); then
+
+            printf '%-25s %s\n' \
+                "DNS mappings" \
+                "$(wc -l < "$OUT/all-subdomains-ip.txt")"
+
+        fi
+
+        printf '%-25s %s\n' \
+            "Failed targets" \
+            "$failed"
+
+        echo
+
+        printf '%-25s %s\n' \
+            "All subdomains" \
+            "$OUT/all-subdomains.txt"
+
+        if (( RESOLVE )); then
+
+            printf '%-25s %s\n' \
+                "Subdomain IP map" \
+                "$OUT/all-subdomains-ip.txt"
+
+        fi
+
+        printf '%-25s %s\n' \
+            "Summary" \
+            "$OUT/summary.txt"
+
+        echo
+
+        printf '%s\n' \
+            "${DIM}Made By Taylor Christian Newsome${RESET}"
+
+        echo
 
     fi
 
-    printf '%-25s %s\n' \
-        "Failed targets" \
-        "$failed"
-
-    echo
-    printf '%-25s %s\n' \
-        "All subdomains" \
-        "$OUT/all-subdomains.txt"
-
-    if (( RESOLVE )); then
-
-        printf '%-25s %s\n' \
-            "Subdomain IP map" \
-            "$OUT/all-subdomains-ip.txt"
-
-    fi
-
-    printf '%-25s %s\n' \
-        "Summary" \
-        "$OUT/summary.txt"
-
-    echo
-    printf '%s\n' \
-        "${DIM}Made By Taylor Christian Newsome${RESET}"
-
-    echo
+    # --------------------------------------------------------
+    # Exit status
+    # --------------------------------------------------------
 
     if (( failed > 0 )); then
         exit 2
     fi
+
+    exit 0
 }
 
 main "$@"
